@@ -277,7 +277,7 @@ def calculateCircularPeriod(stateVec):
 EarthRadius = 6378136.3 # Earth's equatorial radius from EGM96, m.
 MAX_DEGREE = 2 # Maximum degree of the geopotential harmocic expansion to use. 0 equates to two-body problem.
 USE_GEOID = True # Whether to account for Earth's geoid (True) or assume two-body problem (False).
-USE_DRAG = False # Whether to account for drag acceleration (True), or ignore it (False).
+USE_DRAG = True # Whether to account for drag acceleration (True), or ignore it (False).
 Ccoeffs, Scoeffs = readEGM96Coefficients() # Get the gravitational potential exampnsion coefficients.
 
 " Atmospheric density model settings. "
@@ -371,8 +371,7 @@ matplotlib.rc('xtick', labelsize=ticksFontSize)
 matplotlib.rc('ytick', labelsize=ticksFontSize)
 
 #%% FIGURE THAT SHOWS THE EARTH AND SATELLITE TRAJECTORY.
-fig = matplotlib.pyplot.figure(figsize=(12,8))
-ax = Axes3D(fig)
+ax = matplotlib.pyplot.figure().add_subplot(projection='3d')
 ax.set_aspect('auto') #TODO change 3D axes aspect ratio to equal, which isn't supported now. Current workaround is set scale_xyz below.
 ax.view_init(elev=45., azim=45.)
 figRange = 1.5*EarthRadius
@@ -402,7 +401,6 @@ ax.add_artist(zArrow)
 ax.plot(propagatedStates[:,0],propagatedStates[:,1],propagatedStates[:,2], c='r', lw=2, ls='-')
 ax.plot(propagatedStates2Body[:,0],propagatedStates2Body[:,1],propagatedStates2Body[:,2], c='b', lw=2, ls='--')
 
-fig.show()
 
 #%% FIGURE THAT SHOWS THE ALTITUDE AND ORBITAL ENERGY EVOLUTION.
 fig2 = matplotlib.pyplot.figure(figsize=(12,8))
