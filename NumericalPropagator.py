@@ -10,7 +10,9 @@ import matplotlib.pyplot, matplotlib.cm, matplotlib.ticker, matplotlib.font_mana
 import scipy.integrate, numpy, csv, math
 import pandas as pd
 from datetime import datetime, timedelta
-import nrlmsise_00_header, nrlmsise_00
+
+from pymsis import msis
+
 from utilities import GM, Arrow3D
 import pytz
 from astropy import coordinates as coord
@@ -162,20 +164,20 @@ def calculateDragAcceleration(stateVec, epoch, satMass):
     numpy.ndarray of shape (1,3) with three Cartesian components of the
         acceleration in m/s2 given in an inertial reference frame.
     """
-    #    " Prepare the atmospheric density model inputs. "
-#    #TODO - calculate the altitude, latitude, longitude in drag calculation
-    altitude_km = numpy.linalg.norm(stateVec[:3])/1000.0 #TODO this isn't altitude in km, but radius in km. Is this OK?
+    
+    colatitude,longitude,r = calculateGeocentricLatLon(stateVec, epoch)
+    latitude = math.pi/2.0 - colatitude
+    altitude_km = (numpy.linalg.norm(stateVec[:3]) - EarthRadius)/1000. 
+    
+    d_prof = msis.run(epoch, math.degrees(longitude), 
+                      math.degrees(latitude), 
+                      altitude_km, geomagnetic_activity=-1)
 
-    NRLMSISEinput = nrlmsise_00_header.nrlmsise_input(year=0, doy=0, sec=0.0, #TODO should account for the actual epoch in drag calculation...
-                                        alt=altitude_km, g_lat=0.0, g_long=0.0, #TODO should account for the geodetic latitude and longitude in the drag calculation...
-                                        lst=0.0, f107A=F10_7A, f107=F10_7, #TODO should account for the local solar time in the drag calculation...
-                                        ap=MagneticIndex, ap_a=NRLMSISEaph)
-    nrlmsise_00_header.lstCalc( NRLMSISEinput ) # Calculate the local solar time.
     
     " Use the calculated atmospheric density to compute the drag force. "
-    NRLMSISEoutpt = nrlmsise_00_header.nrlmsise_output(); nrlmsise_00.gtd7(NRLMSISEinput, NRLMSISEflags, NRLMSISEoutpt);
-    atmosphericDensity = NRLMSISEoutpt.d[5]/1000.0 # Change from gm/cm3 to kg/m3
-    dragForce = -0.5*atmosphericDensity*dragArea*Cd* numpy.power(stateVec[3:],2) # Drag foce in Newtons.
+    atmosphericDensity = d_prof[0,0] # kg/m3
+    dragForce = -0.5*atmosphericDensity*dragArea*Cd*\
+        numpy.sqrt(numpy.power(stateVec[3:],2))*stateVec[3:]# Drag foce in Newtons.
     return dragForce/satMass
 
 def calculateGravityAcceleration(stateVec, epoch, useGeoid):
@@ -281,8 +283,8 @@ USE_DRAG = True # Whether to account for drag acceleration (True), or ignore it 
 Ccoeffs, Scoeffs = readEGM96Coefficients() # Get the gravitational potential exampnsion coefficients.
 
 " Atmospheric density model settings. "
-NRLMSISEflags = nrlmsise_00_header.nrlmsise_flags()
-NRLMSISEaph = nrlmsise_00_header.ap_array() #TODO NRLMSISE header should contain the following:
+#NRLMSISEflags = nrlmsise_00_header.nrlmsise_flags()
+#NRLMSISEaph = nrlmsise_00_header.ap_array() #TODO NRLMSISE header should contain the following:
 # * Array containing the following magnetic values:
 # *   0 : daily AP
 # *   1 : 3 hr AP index for current time
@@ -300,13 +302,13 @@ MagneticIndex = 40 # Daily magnetic index.
 #%% PROPAGATE THE ORBIT NUMERICALLY.
 " Initial properties of the satellite. "
 satelliteMass = 1000. # kg
-Cd = 2.2 # Drag coefficient, dimensionless.
-dragArea = 5.0 # Area exposed to atmospheric drag, m2.
+Cd = 5 # Drag coefficient, dimensionless.
+dragArea = 15.0 # Area exposed to atmospheric drag, m2.
 
 " Initial state of the satellite. "
 state_0 = numpy.array([EarthRadius+500.0e3,0.,0.,0.,0.,0.]) # Initial state vector with Cartesian positions and velocities in m and m/s.
 state_0[5] = numpy.sqrt( GM/numpy.linalg.norm(state_0[:3]) ) # Simple initial condition for test purposes: a circular orbit with velocity pointing along the +Z direction.
-epoch_0 = datetime(2017, 9, 27, 12, 22, 0, 200, tzinfo=pytz.UTC)
+epoch_0 = datetime(2024, 5, 10, 12, 0, 0, 0, tzinfo=pytz.UTC)
 initialOrbitalPeriod = calculateCircularPeriod(state_0) # Orbital period of the initial circular orbit.
 
 ######## Initial gravity acceleration - redundant because will be re-computed in computeRateOfChangeOfState?
@@ -331,7 +333,7 @@ initialOrbitalPeriod = calculateCircularPeriod(state_0) # Orbital period of the 
 
 " Propagation time settings. "
 INTEGRATION_TIME_STEP_S = 10.0 # Time step at which the trajectory will be propagated.
-NO_ORBITS = 20 # For how manyu orbits to propagate.
+NO_ORBITS = 25 # For how manyu orbits to propagate.
 
 epochsOfInterest = pd.date_range(start=epoch_0,
                                  end=epoch_0+timedelta(seconds=NO_ORBITS*initialOrbitalPeriod),
@@ -350,6 +352,7 @@ for i in range(1, len(epochsOfInterest)): # Propagate the state to all the desir
 
 # Propagate with two-body for comparison.
 USE_GEOID = False
+USE_DRAG = False 
 propagatedStates2Body[0,:] = state_0 # Apply the initial condition.
 for i in range(1, len(epochsOfInterest)): # Propagate the state to all the desired epochs statring from state_0.
     propagatedStates2Body[i,:] = RungeKutta4(propagatedStates2Body[i-1], epochsOfInterest[i-1],
