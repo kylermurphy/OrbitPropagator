@@ -6,26 +6,30 @@ Created on Sat Feb 28 22:08:40 2015
 """
 
 import cProfile
+from pstats import SortKey, Stats
 
 import matplotlib.pyplot, matplotlib.cm, matplotlib.ticker, matplotlib.font_manager
-import scipy.integrate
 import csv 
-import math
 import pandas as pd
 import numpy as np
 import pytz
 from datetime import datetime, timedelta
-from pstats import SortKey, Stats
 
+from scipy.integrate import solve_ivp
 from pymsis import msis
 
-from utilities import GM, Arrow3D
+from scipy.special import legendre
 
-from mpl_toolkits.mplot3d import Axes3D
+from numpy import power, sign, cos, sin, sqrt, zeros, array, cross
+from numpy.linalg import norm
 
-from astropy import coordinates as coord
+from astropy.coordinates import GCRS, ITRS, CartesianRepresentation
 from astropy import units as u
 from astropy.time import Time
+
+pi = np.pi
+GM = 3986004.415E8 # Earth's gravity constant from EGM96, m**3/s**2.
+atm_rot_vec = array([0.0,0.0,72.9211E-6]) # rads / s 
 
 def readEGM96Coefficients():
     """ Read the EGM96 gravitational field model coefficients from EGM96coefficients
@@ -73,7 +77,7 @@ def readEGM96Coefficients():
     return Ccoeffs, Scoeffs
 
 #TODO RK4 causes some numerical oscillation and dissipation in progapation, even in two-body problem. Need something better.
-def RungeKutta4(X, t, dt, rateOfChangeFunction):
+def RungeKutta4(X, t, dt, is_dt, rateOfChangeFunction):
     """ Use fourth-order Runge-Kutta numericla integration method to propagate
     a system of differential equations from state X, expressed at time t, by a
     time increment dt. Evolution of the sytstem is given by the rateOfChangeFunction
@@ -95,11 +99,11 @@ def RungeKutta4(X, t, dt, rateOfChangeFunction):
         in an inertial reference frame in metres and metres per second, respectively,
         propagated to time t+dt.
     """
-    dxdt = rateOfChangeFunction(X, t)
+    dxdt = rateOfChangeFunction(t, X)
     k0 = dt*dxdt
-    k1 = dt*rateOfChangeFunction(X+k0/2., t+timedelta(seconds=dt/2.))
-    k2 = dt*rateOfChangeFunction(X+k1/2., t+timedelta(seconds=dt/2.))
-    k3 = dt*rateOfChangeFunction(X+k2, t+timedelta(seconds=dt))
+    k1 = dt*rateOfChangeFunction(t+is_dt/2., X+k0/2.)
+    k2 = dt*rateOfChangeFunction(t+is_dt/2., X+k1/2.)
+    k3 = dt*rateOfChangeFunction(t+is_dt, X+k2)
     return X + (k0+2.*k1+2.*k2+k3)/6.
 
 """
@@ -130,27 +134,25 @@ def calculateGeocentricLatLon(stateVec, epoch):
     http://agamenon.tsc.uah.es/Asignaturas/it/rd/apuntes/RxControl_Manual.pdf
     """
     # Get the state vector and epoch in astropy's formats.
-    epochAstro = Time(epoch, scale='utc', format='datetime')
-    stateVecAstro = coord.CartesianRepresentation(x=stateVec[0], y=stateVec[1],
+    #epochAstro = Time(epoch, scale='utc', format='datetime')
+    stateVecAstro = CartesianRepresentation(x=stateVec[0], y=stateVec[1],
                                              z=stateVec[2], unit=u.m)
     
-    # Convert from the inertial reference frame (assume GCRS, which is practically
+    # Convert from the inertial reference frame
+    # (assume GCRS, which is practically
     # the same as J2000) to Earth-fixed ITRS.
-    stateVec_GCRS = coord.GCRS(stateVecAstro, obstime=epochAstro)
-
-    stateVec_ITRS = stateVec_GCRS.transform_to(coord.ITRS(obstime=epochAstro))
-
-    loc = coord.EarthLocation.from_geocentric(*stateVec_ITRS.cartesian.xyz, unit=u.m)
+    stateVec_GCRS = GCRS(stateVecAstro, obstime=epoch)
+    stateVec_ITRS = stateVec_GCRS.transform_to(ITRS(obstime=epoch))
 
     # Compute the gravity acceleration in Earth-fixed frame.
-    r = np.linalg.norm(stateVec[:3])
-    lat = loc.lat.to_value(u.rad)
-    colat = math.pi/2.0 - loc.lat.to_value(u.rad)
-    lon = loc.lon.to_value(u.rad)
+    r = norm(stateVec[:3])
+    lat = stateVec_ITRS.earth_location.lat.to_value(u.rad)
+    colat = pi/2.0 - lat
+    lon = stateVec_ITRS.earth_location.lon.to_value(u.rad)
     
-    return colat, lon, r
+    return colat, lat, lon, r
 
-def calculateDragAcceleration(stateVec, epoch, satMass):
+def calculateDragAcceleration(stateVec, geocent_pos, epoch, satMass):
     """ Calculate the acceleration due to atmospheric drag acting on the
     satellite at a given state (3 positions and 3 velocities) and epoch.
     Use NRLMSISE2000 atmospheric model with globally defined solar activity
@@ -173,23 +175,24 @@ def calculateDragAcceleration(stateVec, epoch, satMass):
     numpy.ndarray of shape (1,3) with three Cartesian components of the
         acceleration in m/s2 given in an inertial reference frame.
     """
+    geo = -1 if USE_STORM else 1 
+    _, lat, lon, r = geocent_pos
+    alt_km = (r - EarthRadius)/1000. 
     
-    colatitude,longitude,r = calculateGeocentricLatLon(stateVec, epoch)
-    latitude = math.pi/2.0 - colatitude
-    altitude_km = (np.linalg.norm(stateVec[:3]) - EarthRadius)/1000. 
-    
-    d_prof = msis.run(epoch, math.degrees(longitude), 
-                      math.degrees(latitude), 
-                      altitude_km, geomagnetic_activity=-1)
+    d_prof = msis.run(epoch, lon*180./pi, 
+                      lat*180./pi, 
+                      [alt_km,400], geomagnetic_activity=geo)
 
+    v_rel = stateVec[3:] - cross(atm_rot_vec,stateVec[:3])
     
     " Use the calculated atmospheric density to compute the drag force. "
-    atmosphericDensity = d_prof[0,0] # kg/m3
+    atmosphericDensity = d_prof[0,0,0,0,0] # kg/m3
     dragForce = -0.5*atmosphericDensity*dragArea*Cd*\
-        np.power(stateVec[3:],2)*np.sign(stateVec[3:])# Drag foce in Newtons.
+        power(v_rel,2)*sign(v_rel)# Drag foce in Newtons.
+        
     return dragForce/satMass
 
-def calculateGravityAcceleration(stateVec, epoch, useGeoid):
+def calculateGravityAcceleration(stateVec, geocent_pos):
     """ Calculate the acceleration due to gravtiy acting on the satellite at
     a given state (3 positions and 3 velocities). Ignore satellite's mass,
     i.e. use a restricted two-body problem.
@@ -209,37 +212,35 @@ def calculateGravityAcceleration(stateVec, epoch, useGeoid):
     numpy.ndarray of shape (1,3) with three Cartesian components of the
         acceleration in m/s2 given in an inertial reference frame.
     """
-    if useGeoid:
-        " Compute geocentric co-latitude, longitude & radius. "
-        colatitude, longitude, r = calculateGeocentricLatLon(stateVec, epoch)
 
-        " Find the gravitational potential at the desired point. "
-        # See Eq. 1 in Cunningham (1996) for the general form of the geopotential expansion.
-        gravitationalPotential = 0.0 # Potential of the gravitational field at the stateVec location.
-        for degree in range(0, MAX_DEGREE+1): # Go through all the desired orders and compute the geoid corrections to the sphere.
-            temp = 0. # Contribution to the potential from the current degree and all corresponding orders.
-            legendreCoeffs = scipy.special.legendre(degree) # Legendre polynomial coefficients corresponding to the current degree.
-            for order in range(degree+1): # Go through all the orders corresponding to the currently evaluated degree.
-                if (abs(colatitude-math.pi/2. <= 1E-16)) or (abs(colatitude-3*math.pi/2. <= 1E-16)): # We're at the equator, cos(colatitude) will be zero and things will break.
-                    temp += legendreCoeffs[order] *         1.0          * (Ccoeffs[degree][order]*math.cos( order*longitude ) + Scoeffs[degree][order]*math.sin( order*longitude ))
-                else:
-                    temp += legendreCoeffs[order] * math.cos(colatitude) * (Ccoeffs[degree][order]*math.cos( order*longitude ) + Scoeffs[degree][order]*math.sin( order*longitude ))
+    " Compute geocentric co-latitude, longitude & radius. "
+    colatitude, latitude, longitude, r = geocent_pos
 
-            gravitationalPotential += math.pow(EarthRadius/r, degree) * temp # Add the contribution from the current degree.
+    cos_colat = 1.0 if (abs(colatitude-pi/2. <= 1E-16)) or\
+        (abs(colatitude-3*pi/2. <= 1E-16))\
+            else cos(colatitude)
 
-        gravitationalPotential *= GM/r # Final correction (*GM for acceleration, /r to get r^(n+1) in the denominator).
+    " Find the gravitational potential at the desired point. "
+    # See Eq. 1 in Cunningham (1996) for the general form of the geopotential expansion.
+    gravitationalPotential = 0.0 # Potential of the gravitational field at the stateVec location.
+    for degree in range(0, MAX_DEGREE+1): # Go through all the desired orders and compute the geoid corrections to the sphere.
+        temp = 0. # Contribution to the potential from the current degree and all corresponding orders.
+        legendreCoeffs = legendre(degree) # Legendre polynomial coefficients corresponding to the current degree.
+        for order in range(degree+1): # Go through all the orders corresponding to the currently evaluated degree.
+            temp += legendreCoeffs[order] * cos_colat * (Ccoeffs[degree][order]*cos( order*longitude ) + Scoeffs[degree][order]*sin( order*longitude ))
 
-        " Compute the acceleration due to the gravity potential at the given point. "
-        # stateVec is defined w.r.t. Earth's centre of mass, so no need to account
-        # for the geoid shape here.
-        gravityAcceleration = gravitationalPotential/r* (-1.*stateVec[:3]/r) # First divide by the radius to get the acceleration value, then get the direction (towards centre of the Earth).
-    else:
-        r = np.linalg.norm(stateVec[:3]) # Earth-centred radius.
-        gravityAcceleration = GM/(r*r) * (-1.*stateVec[:3]/r) # First compute the magnitude, then get the direction (towards centre of the Earth).
+        gravitationalPotential += power(EarthRadius/r, degree) * temp # Add the contribution from the current degree.
+
+    gravitationalPotential *= GM/r # Final correction (*GM for acceleration, /r to get r^(n+1) in the denominator).
+
+    " Compute the acceleration due to the gravity potential at the given point."
+    # stateVec is defined w.r.t. Earth's centre of mass, so no need to account
+    # for the geoid shape here.
+    gravityAcceleration = gravitationalPotential/r* (-1.*stateVec[:3]/r) # First divide by the radius to get the acceleration value, then get the direction (towards centre of the Earth).
 
     return gravityAcceleration
     
-def computeRateOfChangeOfState(stateVector, epoch):
+def computeRateOfChangeOfState(epoch, stateVector):
     """ Compute the rate of change of the state vector.
     
     Arguments
@@ -255,21 +256,39 @@ def computeRateOfChangeOfState(stateVector, epoch):
         in the same inertial frame as the one in which stateVector was given.
     """
     
+    t_epoch = epoch_0+timedelta(seconds=epoch)
     
-    gravityAcceleration = calculateGravityAcceleration(stateVector, epoch, USE_GEOID) # A vector of the gravity force from EGM96 model.
+    geocen_pos = calculateGeocentricLatLon(stateVector,t_epoch)
+    
+    if USE_GEOID:
+        # A vector of the gravity force from EGM96 model.
+        gravityAcceleration = calculateGravityAcceleration(stateVector, 
+                                                           geocen_pos) 
+    else:
+        # Earth-centred radius
+        r = norm(stateVector[:3])
+        # First compute the magnitude, then get the direction 
+        #(towards centre of the Earth)
+        gravityAcceleration = GM/(r*r) * (-1.*stateVector[:3]/r)
 
     if USE_DRAG:
-        dragAcceleration = calculateDragAcceleration(stateVector, epoch, satelliteMass) #  A vector of the drag computed with NRLMSISE-00.
+        #  A vector of the drag computed with NRLMSISE
+        dragAcceleration = calculateDragAcceleration(stateVector, geocen_pos, 
+                                                     t_epoch, satelliteMass) 
     else:
-        dragAcceleration = [0.,0.,0.]
+        dragAcceleration = zeros(3)
     
-    stateDerivatives = np.zeros(6);
-    stateDerivatives[:3] = stateVector[3:]; # Velocity is the rate of change of position.
-    stateDerivatives[3:] = dragAcceleration+gravityAcceleration # Compute the acceleration i.e. the rate of change of velocity.
+    stateDerivatives = zeros(6)
+    # Velocity is the rate of change of position.
+    stateDerivatives[:3] = stateVector[3:]; 
+    # Compute the acceleration i.e. the rate of change of velocity.
+    stateDerivatives[3:] = dragAcceleration+gravityAcceleration 
     return stateDerivatives
 
 def calculateCircularPeriod(stateVec):
-    """ Calculate the orbital period of a circular, Keplerian orbit passing through
+    """Calculate period.
+    
+    Calculate the orbital period of a circular, Keplerian orbit passing through
     the state vector (3 positions and velocities).
     
     Arguments
@@ -278,100 +297,77 @@ def calculateCircularPeriod(stateVec):
         in mtres and m/s, respectively.
     
     Returns
-    ----------
+    -------
     Orbital period of a circular orbit corresponding to the supplied state vector
         in seconds.
     """
-    return 2*math.pi*np.sqrt(math.pow(np.linalg.norm(stateVec[:3]),3)/GM)
+    return 2*pi*sqrt(power(norm(stateVec[:3]),3)/GM)
 
-#%% FORCE MODEL SETTINGS.
-" Gravity model settings. "
-
+# FORCE MODEL SETTINGS.
 EarthRadius = 6378136.3 # Earth's equatorial radius from EGM96, m.
 MAX_DEGREE = 2 # Maximum degree of the geopotential harmocic expansion to use. 0 equates to two-body problem.
 USE_GEOID = True # Whether to account for Earth's geoid (True) or assume two-body problem (False).
 USE_DRAG = True # Whether to account for drag acceleration (True), or ignore it (False).
+USE_STORM = False # Whether to account for geomagnet storms in MSIS
+satelliteMass = 260. # kg
+Cd = 5 # Drag coefficient, dimensionless.
+dragArea = 2.8*1.4 # Area exposed to atmospheric drag, m2.
 Ccoeffs, Scoeffs = readEGM96Coefficients() # Get the gravitational potential exampnsion coefficients.
 
-" Atmospheric density model settings. "
-#NRLMSISEflags = nrlmsise_00_header.nrlmsise_flags()
-#NRLMSISEaph = nrlmsise_00_header.ap_array() #TODO NRLMSISE header should contain the following:
-# * Array containing the following magnetic values:
-# *   0 : daily AP
-# *   1 : 3 hr AP index for current time
-# *   2 : 3 hr AP index for 3 hrs before current time
-# *   3 : 3 hr AP index for 6 hrs before current time
-# *   4 : 3 hr AP index for 9 hrs before current time
-# *   5 : Average of eight 3 hr AP indicies from 12 to 33 hrs
-# *           prior to current time
-# *   6 : Average of eight 3 hr AP indicies from 36 to 57 hrs
-# *           prior to current time
-F10_7A = 70 # 81-day average F10.7.
-F10_7 = 180 # Daily F10.7 for the previous day.
-MagneticIndex = 40 # Daily magnetic index.
 
-#%% PROPAGATE THE ORBIT NUMERICALLY.
+state_0 = np.array([0,0.,0.,0.,0.,0.]) # Initial state vector with Cartesian positions and velocities in m and m/s.
+state_0[0] = EarthRadius+300.0e3
+state_0[5] = sqrt( GM/norm(state_0[:3]) ) # Simple initial condition for test purposes: a circular orbit with velocity pointing along the +Z direction.
+
+state_0[:3] = [4315507.46246294,  2200530.67019826, -4554414.58722182]
+state_0[3:] = [-211.29632325, 7043.76994196, 3206.89045033]
+
+epoch_0 = datetime(2024, 10, 10, 20, 0, 2, 0, tzinfo=pytz.UTC)
+OrbitalPeriod_0 = calculateCircularPeriod(state_0) # Orbital period of the initial circular orbit.
+
+# PROPAGATE THE ORBIT NUMERICALLY.
 cp = cProfile.Profile()
 cp.enable()
-" Initial properties of the satellite. "
-satelliteMass = 1000. # kg
-Cd = 5 # Drag coefficient, dimensionless.
-dragArea = 15.0 # Area exposed to atmospheric drag, m2.
-
-" Initial state of the satellite. "
-state_0 = np.array([EarthRadius+500.0e3,0.,0.,0.,0.,0.]) # Initial state vector with Cartesian positions and velocities in m and m/s.
-state_0[5] = np.sqrt( GM/np.linalg.norm(state_0[:3]) ) # Simple initial condition for test purposes: a circular orbit with velocity pointing along the +Z direction.
-epoch_0 = datetime(2024, 5, 10, 12, 0, 0, 0, tzinfo=pytz.UTC)
-initialOrbitalPeriod = calculateCircularPeriod(state_0) # Orbital period of the initial circular orbit.
 
 
-" Propagation time settings. "
-INTEGRATION_TIME_STEP_S = 10.0 # Time step at which the trajectory will be propagated.
-NO_ORBITS = 5 # For how manyu orbits to propagate.
+INT_STEP_S = 10.0 # Time step at which the trajectory will be propagated.
+MAX_STEP_S = 120.0
+NO_ORBITS = 15 # For how manyu orbits to propagate.
 
-epochsOfInterest = pd.date_range(start=epoch_0,
-                                 end=epoch_0+timedelta(seconds=NO_ORBITS*initialOrbitalPeriod),
-                                 freq=pd.DateOffset(seconds=INTEGRATION_TIME_STEP_S)
+epochs = pd.date_range(start=epoch_0,
+                                 end=epoch_0+
+                                 timedelta(seconds=NO_ORBITS*OrbitalPeriod_0),
+                                 freq=pd.DateOffset(seconds=INT_STEP_S)
                                  ).to_pydatetime().tolist()
 
-propagatedStates = np.zeros( (len(epochsOfInterest),6) ) # State vectors at the  epochs of interest.
-propagatedStates2Body = np.zeros( (len(epochsOfInterest),6) ) # W/o geoid, i.e. two-body acceleration for comparison.
+t = [(dt-epoch_0).total_seconds() for dt in epochs]
 
-" Actual numerical propagation main loop. "
-propagatedStates[0,:] = state_0 # Apply the initial condition.
-for i in range(1, len(epochsOfInterest)): # Propagate the state to all the desired epochs statring from state_0.
-    propagatedStates[i,:] = RungeKutta4(propagatedStates[i-1], epochsOfInterest[i-1],
-                                        INTEGRATION_TIME_STEP_S, computeRateOfChangeOfState)
-    #TODO check if altitude isn't too low during propagation.
+## Propoage the function
+state = solve_ivp(computeRateOfChangeOfState, [t[0],t[-1]], 
+                       state_0, t_eval=t, first_step=INT_STEP_S, 
+                       max_step=MAX_STEP_S, method='DOP853', 
+                       atol = 1E-9, rtol = 1e-6)
 
-# Propagate with two-body for comparison.
-USE_GEOID = False
-USE_DRAG = False 
-propagatedStates2Body[0,:] = state_0 # Apply the initial condition.
-for i in range(1, len(epochsOfInterest)): # Propagate the state to all the desired epochs statring from state_0.
-    propagatedStates2Body[i,:] = RungeKutta4(propagatedStates2Body[i-1], epochsOfInterest[i-1],
-                                        INTEGRATION_TIME_STEP_S, computeRateOfChangeOfState)
+s_df = pd.DataFrame({'x':state.y.transpose()[:,0], 
+                     'y':state.y.transpose()[:,1],
+                     'z':state.y.transpose()[:,3],
+                     'alt':norm(state.y.transpose()[:,:3],axis=1)-EarthRadius},
+                    index=epochs)
 
-" Compute quantities derived from the propagated state vectors. "
-altitudes = np.linalg.norm(propagatedStates[:,:3], axis=1) - EarthRadius # Altitudes above spherical Earth...
-specificEnergies = [ np.linalg.norm(x[3:])*np.linalg.norm(x[3:]) -
-                    GM*satelliteMass/np.linalg.norm(x[:3]) for x in propagatedStates] # ...and corresponding specific orbital energies.
-
-altitudes2Body = np.linalg.norm(propagatedStates2Body[:,:3], axis=1) - EarthRadius
 
 cp.disable()
 Stats(cp).strip_dirs().sort_stats(SortKey.CUMULATIVE).print_stats(100)
 
 
-#%% PLOT FORMATTING.
-ticksFontSize = 15
-labelsFontSize = 30
-titleFontSize = 34
+# PLOT FORMATTING.
+ticksFontSize = 8
+labelsFontSize = 15
+titleFontSize = 15
 
 matplotlib.rc('xtick', labelsize=ticksFontSize) 
 matplotlib.rc('ytick', labelsize=ticksFontSize)
 
-#%% FIGURE THAT SHOWS THE EARTH AND SATELLITE TRAJECTORY.
+# FIGURE THAT SHOWS THE EARTH AND SATELLITE TRAJECTORY.
 ax = matplotlib.pyplot.figure().add_subplot(projection='3d')
 ax.set_aspect('auto') #TODO change 3D axes aspect ratio to equal, which isn't supported now. Current workaround is set scale_xyz below.
 ax.view_init(elev=45., azim=45.)
@@ -383,8 +379,8 @@ ax.auto_scale_xyz([-figRange, figRange], [-figRange, figRange], [-figRange, figR
 
 " Plot a sphere that represents the Earth and the coordinate frame. "
 N_POINTS = 20 # Number of lattitudes and longitudes used to plot the geoid.
-latitudes = np.linspace(0, math.pi, N_POINTS) # Geocentric latitudes and longitudes where the geoid will be visualised.
-longitudes = np.linspace(0, 2*math.pi, N_POINTS)
+latitudes = np.linspace(0, pi, N_POINTS) # Geocentric latitudes and longitudes where the geoid will be visualised.
+longitudes = np.linspace(0, 2*pi, N_POINTS)
 Xs = EarthRadius * np.outer(np.cos(latitudes), np.sin(longitudes))
 Ys = EarthRadius * np.outer(np.sin(latitudes), np.sin(longitudes))
 Zs = EarthRadius * np.outer(np.ones(latitudes.size), np.cos(longitudes))
@@ -393,43 +389,30 @@ earthSurface = ax.plot_surface(Xs, Ys, Zs, rstride=1, cstride=1, linewidth=0,
 
 
 " Plot the trajectory. "
-ax.plot(propagatedStates[:,0],propagatedStates[:,1],propagatedStates[:,2], c='r', lw=2, ls='-')
-ax.plot(propagatedStates2Body[:,0],propagatedStates2Body[:,1],propagatedStates2Body[:,2], c='b', lw=2, ls='--')
+ax.plot(state.y[0,:],state.y[1,:],state.y[2,:], c='b', lw=1, ls='dotted')
 
 
-#%% FIGURE THAT SHOWS THE ALTITUDE AND ORBITAL ENERGY EVOLUTION.
-fig2 = matplotlib.pyplot.figure(figsize=(12,8))
-ax2=fig2.gca()
-ax2_2 = ax2.twinx();
-ax2.set_xlabel(r"$Time\ elapsed\ (s)$", fontsize=labelsFontSize)
-ax2.set_ylabel(r"$Altitude\ above\ spherical\ Earth\ (m)$", fontsize=labelsFontSize)
-ax2_2.set_ylabel(r"$Specific\ orbital\ energy\ (m^2 s^{-2})$", fontsize=labelsFontSize)
-ax2.grid(True, which='both')
-
-ax2.plot(epochsOfInterest, altitudes, c='r', lw=2, ls='-')
-ax2.plot(epochsOfInterest, altitudes2Body, c='b', lw=2, ls='--')
-ax2_2.plot(epochsOfInterest, specificEnergies, c='m', lw=2, ls='-')
-
-fig2.show()
-
-#%% FIGURE SHOWING EVOLUTION OF THE POSITION COMPONENTS OVER TIME.
-fig3, axarr = matplotlib.pyplot.subplots(3, sharex=True, figsize=(12,8))
-axarr[0].grid(linewidth=2); axarr[1].grid(linewidth=2); axarr[2].grid(linewidth=2);
+# FIGURE SHOWING EVOLUTION OF THE POSITION COMPONENTS OVER TIME.
+fig3, axarr = matplotlib.pyplot.subplots(4, sharex=True, figsize=(12,8))
+axarr[0].grid(linewidth=2)
+axarr[1].grid(linewidth=2)
+axarr[2].grid(linewidth=2)
+axarr[3].grid(linewidth=2)
 axarr[0].tick_params(axis='both',reset=False,which='both',length=5,width=1.5)
 axarr[1].tick_params(axis='both',reset=False,which='both',length=5,width=1.5)
 axarr[2].tick_params(axis='both',reset=False,which='both',length=5,width=1.5)
+axarr[3].tick_params(axis='both',reset=False,which='both',length=5,width=1.5)
 
-axarr[2].set_xlabel(r'$Time\ elapsed\ (s)$',fontsize=labelsFontSize)
-axarr[0].set_ylabel(r'$X\ (m)$',fontsize=labelsFontSize)
-axarr[1].set_ylabel(r'$Y\ (m)$',fontsize=labelsFontSize)
-axarr[2].set_ylabel(r'$Z\ (m)$',fontsize=labelsFontSize)
+axarr[3].set_xlabel(r'$Time\ elapsed\ (s)$',fontsize=labelsFontSize)
+axarr[1].set_ylabel(r'$Altitude\ (m)$',fontsize=labelsFontSize)
+axarr[1].set_ylabel(r'$X\ (m)$',fontsize=labelsFontSize)
+axarr[2].set_ylabel(r'$Y\ (m)$',fontsize=labelsFontSize)
+axarr[3].set_ylabel(r'$Z\ (m)$',fontsize=labelsFontSize)
 
-axarr[0].plot(epochsOfInterest, propagatedStates[:,0], c='r', lw=2, ls='-')
-axarr[1].plot(epochsOfInterest, propagatedStates[:,1], c='r', lw=2, ls='-')
-axarr[2].plot(epochsOfInterest, propagatedStates[:,2], c='r', lw=2, ls='-')
+axarr[0].plot(epochs, s_df.alt, c='r')
+axarr[1].plot(epochs, s_df.x, c='r')
+axarr[2].plot(epochs, s_df.y, c='r')
+axarr[3].plot(epochs, s_df.z, c='r')
 
-axarr[0].plot(epochsOfInterest, propagatedStates2Body[:,0], c='b', lw=2, ls='--')
-axarr[1].plot(epochsOfInterest, propagatedStates2Body[:,1], c='b', lw=2, ls='--')
-axarr[2].plot(epochsOfInterest, propagatedStates2Body[:,2], c='b', lw=2, ls='--')
 
 fig3.show()
