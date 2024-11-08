@@ -195,3 +195,33 @@ def coe2rv(sma,ecc,incl,raan,argp,ta):
     pf2ijk = ROT3_raan.dot(ROT1_i).dot(ROT3_w);
 
     return numpy.hstack( (pf2ijk.dot(posPF), pf2ijk.dot(velPF)) )
+
+
+def RungeKutta4(X, t, dt, is_dt, rateOfChangeFunction):
+    """ Use fourth-order Runge-Kutta numericla integration method to propagate
+    a system of differential equations from state X, expressed at time t, by a
+    time increment dt. Evolution of the sytstem is given by the rateOfChangeFunction
+    that gives the rates of change of all the components of state X.
+    
+    Arguments
+    ----------
+    X - numpy.ndarray of shape (1,6) with three Cartesian positions and three velocities
+        in an inertial reference frame in metres and metres per second, respectively.
+    t - datetime, UTC epoch at which state X is defined
+    dt - float, epoch increment to which the state X is to be propagated in seconds.
+    rateOfChangeFunction - function that returns a numpy.ndarray of shape (1,3)
+        with three Cartesian components of the acceleration in m/s2 given in an
+        inertial reference frame. Its arguments are the state X and epoch t.
+    
+    Returns
+    ----------
+    numpy.ndarray of shape (1,6) with three Cartesian positions and three velocities
+        in an inertial reference frame in metres and metres per second, respectively,
+        propagated to time t+dt.
+    """
+    dxdt = rateOfChangeFunction(t, X)
+    k0 = dt*dxdt
+    k1 = dt*rateOfChangeFunction(t+is_dt/2., X+k0/2.)
+    k2 = dt*rateOfChangeFunction(t+is_dt/2., X+k1/2.)
+    k3 = dt*rateOfChangeFunction(t+is_dt, X+k2)
+    return X + (k0+2.*k1+2.*k2+k3)/6.
