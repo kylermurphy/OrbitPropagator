@@ -25,25 +25,27 @@ from numpy.linalg import norm
 
 from astropy.coordinates import GCRS, ITRS, CartesianRepresentation
 from astropy import units as u
-from astropy.time import Time
+
 
 pi = np.pi
 GM = 3986004.415E8 # Earth's gravity constant from EGM96, m**3/s**2.
 atm_rot_vec = array([0.0,0.0,72.9211E-6]) # rads / s 
 
 def readEGM96Coefficients():
-    """ Read the EGM96 gravitational field model coefficients from EGM96coefficients
+    """EGM 96 Coefficients.
+    
+    Read the EGM96 gravitational field model coefficients from EGM96coefficients
     file and parse them to be used with computeGravitationalPotential functions.
     
     Returns
-    ----------
+    -------
     2-tuple of the C and S coefficnients of EGM96 model. They are stored in dictionaries
         of list. The keys are degrees of the potential expansion and the values
         of the list entries are the coefficients corresponding to the orders for
         the expansion to a given degree.
     
     Reference
-    ----------
+    ---------
     EGM96 coefficients have been downloaded from:
         ftp://cddis.gsfc.nasa.gov/pub/egm96/general_info/readme.egm96
     """
@@ -76,35 +78,6 @@ def readEGM96Coefficients():
         
     return Ccoeffs, Scoeffs
 
-#TODO RK4 causes some numerical oscillation and dissipation in progapation, even in two-body problem. Need something better.
-def RungeKutta4(X, t, dt, is_dt, rateOfChangeFunction):
-    """ Use fourth-order Runge-Kutta numericla integration method to propagate
-    a system of differential equations from state X, expressed at time t, by a
-    time increment dt. Evolution of the sytstem is given by the rateOfChangeFunction
-    that gives the rates of change of all the components of state X.
-    
-    Arguments
-    ----------
-    X - numpy.ndarray of shape (1,6) with three Cartesian positions and three velocities
-        in an inertial reference frame in metres and metres per second, respectively.
-    t - datetime, UTC epoch at which state X is defined
-    dt - float, epoch increment to which the state X is to be propagated in seconds.
-    rateOfChangeFunction - function that returns a numpy.ndarray of shape (1,3)
-        with three Cartesian components of the acceleration in m/s2 given in an
-        inertial reference frame. Its arguments are the state X and epoch t.
-    
-    Returns
-    ----------
-    numpy.ndarray of shape (1,6) with three Cartesian positions and three velocities
-        in an inertial reference frame in metres and metres per second, respectively,
-        propagated to time t+dt.
-    """
-    dxdt = rateOfChangeFunction(t, X)
-    k0 = dt*dxdt
-    k1 = dt*rateOfChangeFunction(t+is_dt/2., X+k0/2.)
-    k2 = dt*rateOfChangeFunction(t+is_dt/2., X+k1/2.)
-    k3 = dt*rateOfChangeFunction(t+is_dt, X+k2)
-    return X + (k0+2.*k1+2.*k2+k3)/6.
 
 """
 ===============================================================================
@@ -112,19 +85,21 @@ def RungeKutta4(X, t, dt, is_dt, rateOfChangeFunction):
 ===============================================================================
 """
 def calculateGeocentricLatLon(stateVec, epoch):
-    """ Calculate the geocentric co-latitude (measured from the noth pole not
+    """Get the geocentric Lat/Lon.
+    
+    Calculate the geocentric co-latitude (measured from the noth pole not
     equator), longitude and radius corresponding to the state vector given in
     inertial frame at a certain epoch.
     
     Arguments
-    ----------
+    ---------
     stateVec - numpy.ndarray of shape (1,6) with three Cartesian positions and
         three velocities in an inertial reference frame in metres and metres
         per second, respectively.
     epoch - datetime with the UTC epoch corresponding to the stateVect.
     
     Returns
-    ----------
+    -------
     3-tuple of floats with geocentric latitude, longitude and radius in radians
         and distance units of stateVec.
         
@@ -153,7 +128,9 @@ def calculateGeocentricLatLon(stateVec, epoch):
     return colat, lat, lon, r
 
 def calculateDragAcceleration(stateVec, geocent_pos, epoch, satMass):
-    """ Calculate the acceleration due to atmospheric drag acting on the
+    """Calculate Drag Acceleration.
+    
+    Calculate the acceleration due to atmospheric drag acting on the
     satellite at a given state (3 positions and 3 velocities) and epoch.
     Use NRLMSISE2000 atmospheric model with globally defined solar activity
     proxies:
@@ -163,7 +140,7 @@ def calculateDragAcceleration(stateVec, geocent_pos, epoch, satMass):
         NRLMSISEaph - nrlmsise_00_header.ap_array with magnetic values.#
     
     Arguments
-    ----------
+    ---------
     numpy.ndarray of shape (1,6) with three Cartesian positions and three
         velocities in an inertial reference frame in metres and metres per
             second, respectively.
@@ -171,7 +148,7 @@ def calculateDragAcceleration(stateVec, geocent_pos, epoch, satMass):
         is to be computed.
     
     Returns
-    ----------
+    -------
     numpy.ndarray of shape (1,3) with three Cartesian components of the
         acceleration in m/s2 given in an inertial reference frame.
     """
@@ -193,12 +170,14 @@ def calculateDragAcceleration(stateVec, geocent_pos, epoch, satMass):
     return dragForce/satMass
 
 def calculateGravityAcceleration(stateVec, geocent_pos):
-    """ Calculate the acceleration due to gravtiy acting on the satellite at
+    """Acceleration due to gravity. 
+    
+    Calculate the acceleration due to gravtiy acting on the satellite at
     a given state (3 positions and 3 velocities). Ignore satellite's mass,
     i.e. use a restricted two-body problem.
     
     Arguments
-    ----------
+    ---------
     numpy.ndarray of shape (1,6) with three Cartesian positions and three
         velocities in an inertial reference frame in metres and metres per
             second, respectively.
@@ -208,7 +187,7 @@ def calculateGravityAcceleration(stateVec, geocent_pos):
         expansion (True) or a restricted two-body problem (False).
     
     Returns
-    ----------
+    -------
     numpy.ndarray of shape (1,3) with three Cartesian components of the
         acceleration in m/s2 given in an inertial reference frame.
     """
@@ -241,21 +220,20 @@ def calculateGravityAcceleration(stateVec, geocent_pos):
     return gravityAcceleration
     
 def computeRateOfChangeOfState(epoch, stateVector):
-    """ Compute the rate of change of the state vector.
+    """Compute the rate of change of the state vector.
     
     Arguments
-    ----------
+    ---------
     stateVector - numpy.ndarray of shape (1,6) with three Cartesian positions
         and three velocities given in an inertial frame of reference.
     epoch - detetime corresponding to the UTC epoch at which the rate of change
         is to be computed.
         
     Returns
-    ----------
+    -------
     numpy.ndarray of shape (1,6) with the rates of change of position and velocity
         in the same inertial frame as the one in which stateVector was given.
-    """
-    
+    """    
     t_epoch = epoch_0+timedelta(seconds=epoch)
     
     geocen_pos = calculateGeocentricLatLon(stateVector,t_epoch)
@@ -319,10 +297,10 @@ state_0 = np.array([0,0.,0.,0.,0.,0.]) # Initial state vector with Cartesian pos
 state_0[0] = EarthRadius+300.0e3
 state_0[5] = sqrt( GM/norm(state_0[:3]) ) # Simple initial condition for test purposes: a circular orbit with velocity pointing along the +Z direction.
 
-state_0[:3] = [4315507.46246294,  2200530.67019826, -4554414.58722182]
-state_0[3:] = [-211.29632325, 7043.76994196, 3206.89045033]
+state_0[:3] = [ -632364.22305765, -6618837.49971465,  -241239.39881012]
+state_0[3:] = [ 4641.52375354,  -224.497719  , -6194.7383538 ]
 
-epoch_0 = datetime(2024, 10, 10, 20, 0, 2, 0, tzinfo=pytz.UTC)
+epoch_0 = datetime(2024, 5, 9, 14, 0, 2, 0, tzinfo=pytz.UTC)
 OrbitalPeriod_0 = calculateCircularPeriod(state_0) # Orbital period of the initial circular orbit.
 
 # PROPAGATE THE ORBIT NUMERICALLY.
@@ -332,7 +310,7 @@ cp.enable()
 
 INT_STEP_S = 10.0 # Time step at which the trajectory will be propagated.
 MAX_STEP_S = 120.0
-NO_ORBITS = 15 # For how manyu orbits to propagate.
+NO_ORBITS = 20 # For how manyu orbits to propagate.
 
 epochs = pd.date_range(start=epoch_0,
                                  end=epoch_0+
