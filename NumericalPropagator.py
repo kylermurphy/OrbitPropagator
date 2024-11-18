@@ -8,11 +8,17 @@ Created on Sat Feb 28 22:08:40 2015
 import cProfile
 from pstats import SortKey, Stats
 
-import matplotlib.pyplot, matplotlib.cm, matplotlib.ticker, matplotlib.font_manager
+import matplotlib.pyplot, matplotlib.cm 
+import matplotlib.ticker, matplotlib.font_manager
 import csv 
 import pandas as pd
 import numpy as np
 import pytz
+import aacgmv2
+import pdb
+
+import sklearn
+
 from datetime import datetime, timedelta
 
 from scipy.integrate import solve_ivp
@@ -21,6 +27,7 @@ from pymsis import msis
 from scipy.special import legendre
 
 from numpy import power, sign, cos, sin, sqrt, zeros, array, cross
+from numpy import isfinite
 from numpy.linalg import norm
 
 from astropy.coordinates import GCRS, ITRS, CartesianRepresentation
@@ -30,6 +37,12 @@ from astropy import units as u
 pi = np.pi
 GM = 3986004.415E8 # Earth's gravity constant from EGM96, m**3/s**2.
 atm_rot_vec = array([0.0,0.0,72.9211E-6]) # rads / s 
+
+global mlt_l
+mlt_l = False
+
+global atm_d
+atm_d = list()
 
 def readEGM96Coefficients():
     """EGM 96 Coefficients.
@@ -156,14 +169,73 @@ def calculateDragAcceleration(stateVec, geocent_pos, epoch, satMass):
     _, lat, lon, r = geocent_pos
     alt_km = (r - EarthRadius)/1000. 
     
-    d_prof = msis.run(epoch, lon*180./pi, 
-                      lat*180./pi, 
-                      [alt_km,400], geomagnetic_activity=geo)
+    
+    try:
+        d_prof = msis.run(epoch, lon*180./pi, 
+                          lat*180./pi, 
+                          [alt_km,400], geomagnetic_activity=geo)
+    except Exception as e: 
+        pdb.set_trace()
 
     v_rel = stateVec[3:] - cross(atm_rot_vec,stateVec[:3])
     
     " Use the calculated atmospheric density to compute the drag force. "
-    atmosphericDensity = d_prof[0,0,0,0,0] # kg/m3
+    if USE_RFML:
+        global mlt_l
+        # get the parameters we need for run the RF ML mode
+        f_idx = rf_input.index.get_indexer([epoch.replace(tzinfo=None)], 
+                                           method='nearest')
+        f_dat = rf_input.iloc[f_idx].copy()
+        
+        alat = lat*180./pi
+        alon = lon*180./pi
+        
+        alat = sign(alat)*20.1 if abs(alat) < 20. else alat
+        
+        _, _, mlt = aacgmv2.get_aacgm_coord(alat, alon, 400,
+                                      epoch.replace(tzinfo=None),
+                                      method='GEOCENTRIC')
+        
+        if isfinite(mlt):
+            mlt_l = mlt
+        else:
+            if mlt_l:
+                mlt = mlt_l
+            else:
+                dl = 0.5 if alat>0 else -0.5
+                mlt_b = np.nan
+                while not isfinite(mlt_b):
+                    alat = alat+dl
+                    _, _, mlt_b = aacgmv2.get_aacgm_coord(alat, alon, 400,
+                                                  epoch.replace(tzinfo=None),
+                                                  method='GEOCENTRIC')
+
+                mlt_l = mlt_b
+                mlt = mlt_b
+                
+                
+                
+        
+        
+        f_dat['SatLat'] = lat*180./pi
+        f_dat['cos_SatMagLT'] = cos(mlt*2*pi/24.)
+        f_dat['sin_SatMagLT'] = sin(mlt*2*pi/24.)
+        
+        try:
+            d400 = rf_ml.predict(f_dat)*10**-12
+        except:
+            d400 = d_prof[0,0,0,0,0]
+        
+        #scale the 400 km density to the height of the satellite
+        atmosphericDensity = d_prof[0,0,0,0,0]*d400/d_prof[0,0,0,1,0]
+        
+        
+    else:
+        atmosphericDensity = d_prof[0,0,0,0,0] # kg/m3
+        
+    global atm_d
+    atm_d.append(atmosphericDensity)
+        
     dragForce = -0.5*atmosphericDensity*dragArea*Cd*\
         power(v_rel,2)*sign(v_rel)# Drag foce in Newtons.
         
@@ -286,21 +358,31 @@ EarthRadius = 6378136.3 # Earth's equatorial radius from EGM96, m.
 MAX_DEGREE = 2 # Maximum degree of the geopotential harmocic expansion to use. 0 equates to two-body problem.
 USE_GEOID = True # Whether to account for Earth's geoid (True) or assume two-body problem (False).
 USE_DRAG = True # Whether to account for drag acceleration (True), or ignore it (False).
-USE_STORM = False # Whether to account for geomagnet storms in MSIS
+USE_STORM = True # Whether to account for geomagnet storms in MSIS
+USE_RFML = False
 satelliteMass = 260. # kg
 Cd = 5 # Drag coefficient, dimensionless.
-dragArea = 2.8*1.4 # Area exposed to atmospheric drag, m2.
+dragArea = 24 # Area exposed to atmospheric drag, m2.
 Ccoeffs, Scoeffs = readEGM96Coefficients() # Get the gravitational potential exampnsion coefficients.
 
+# get the random forest model 
+rf_ml = pd.read_pickle("D:\data\SatDensities\FI_GEO_RFdat_AIMFAHR.pkl")[0]
+
+# sklearn train version must be the same as the installed
+if sklearn.__version__ != rf_ml.__getstate__()['_sklearn_version']:
+    USE_RFML = False
+else:
+    rf_input = pd.read_hdf(
+        "D:\data\SatDensities\FI_GEO_RFdat_AIMFAHR_inputs_MayStorm.hdf")
 
 state_0 = np.array([0,0.,0.,0.,0.,0.]) # Initial state vector with Cartesian positions and velocities in m and m/s.
 state_0[0] = EarthRadius+300.0e3
 state_0[5] = sqrt( GM/norm(state_0[:3]) ) # Simple initial condition for test purposes: a circular orbit with velocity pointing along the +Z direction.
 
-state_0[:3] = [ -632364.22305765, -6618837.49971465,  -241239.39881012]
-state_0[3:] = [ 4641.52375354,  -224.497719  , -6194.7383538 ]
+state_0[:3] = [-6556040.07395412,  2081708.80924815,   891365.75101391]
+state_0[3:] = [-2324.6552955,  -5130.47304865, -5079.3844195 ]
 
-epoch_0 = datetime(2024, 5, 9, 14, 0, 2, 0, tzinfo=pytz.UTC)
+epoch_0 = datetime(2024, 5, 10, 12, 00, 00, 0, tzinfo=pytz.UTC)
 OrbitalPeriod_0 = calculateCircularPeriod(state_0) # Orbital period of the initial circular orbit.
 
 # PROPAGATE THE ORBIT NUMERICALLY.
@@ -326,12 +408,26 @@ state = solve_ivp(computeRateOfChangeOfState, [t[0],t[-1]],
                        max_step=MAX_STEP_S, method='DOP853', 
                        atol = 1E-9, rtol = 1e-6)
 
+# state = solve_ivp(computeRateOfChangeOfState, [t[0],t[-1]], 
+#                        state_0, first_step=INT_STEP_S, 
+#                        max_step=MAX_STEP_S, method='DOP853', 
+#                        atol = 1E-9, rtol = 1e-6)
+
+if len(epochs) != state.t.shape[0]:
+    epochs = [epoch_0 + pd.Timedelta(t) for t in state.t]
+
 s_df = pd.DataFrame({'x':state.y.transpose()[:,0], 
                      'y':state.y.transpose()[:,1],
                      'z':state.y.transpose()[:,3],
                      'alt':norm(state.y.transpose()[:,:3],axis=1)-EarthRadius},
                     index=epochs)
 
+if USE_RFML:
+    r_df = s_df.copy()
+    r_d = np.array(atm_d)
+else:
+    m_df = s_df.copy()
+    m_d = np.array(atm_d)
 
 cp.disable()
 Stats(cp).strip_dirs().sort_stats(SortKey.CUMULATIVE).print_stats(100)
